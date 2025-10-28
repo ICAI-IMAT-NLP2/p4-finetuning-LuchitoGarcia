@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 
 try:
@@ -7,92 +8,104 @@ try:
 except:
     from src.utils import download_and_load_model
 
+
 class LoRA(nn.Module):
-    def __init__(self, original_layer, r=4, alpha=32):
+    def __init__(self, original_layer: nn.Linear, r: int = 4, alpha: int = 32):
         """
         Low-Rank Adaptation (LoRA) module.
-        
+
         Args:
-            original_layer (nn.Module): The original layer to which LoRA is applied.
-            r (int): Rank of the low-rank approximation.
-            alpha (int): Scaling factor for the LoRA module.
+            original_layer (nn.Linear): Capa lineal original a la que se aplica LoRA.
+            r (int): Rango de la aproximación de baja-rank.
+            alpha (int): Factor de escala de LoRA.
         """
         super().__init__()
-        # TODO: Initialize LoRA parameters
-        self.r = None
-        self.alpha = None
-        self.original_layer = None
+        if not isinstance(original_layer, nn.Linear):
+            raise TypeError("LoRA solo admite nn.Linear como capa original.")
 
-        # TODO: Low-rank matrices A and B for LoRA
-        self.A = None
-        self.B = None
+        self.r = r
+        self.alpha = alpha
+        self.original_layer = original_layer
 
-        # TODO: Initialize LoRA weights (B is zero-initialized, A is random)
-        nn.init.kaiming_uniform_(None)
-        
-        # TODO: Scaling factor alpha 
-        self.scaling = None
+        in_features = original_layer.in_features
+        out_features = original_layer.out_features
 
-        # TODO: Freeze the original layer parameters
-        for param in None:
-            param.requires_grad = False
-                
-    def forward(self, x):
-        # TODO: Perform forward pass with low-rank update
-        return None
+        # Matrices de baja-rank A y B
+        # A: (out_features, r), B: (r, in_features)
+        self.A = nn.Parameter(torch.empty(out_features, r))
+        self.B = nn.Parameter(torch.empty(r, in_features))
 
-def inject_lora_into_model(model, r=4, alpha=32, device='cpu'):
+        # Inicialización: A con Kaiming, B a ceros (como en el paper)
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        nn.init.zeros_(self.B)
+
+        # Escalado alpha/r
+        self.scaling = float(self.alpha) / float(self.r)
+
+        # Congelar parámetros de la capa original
+        for p in self.original_layer.parameters():
+            p.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Aplica la capa original con un update de baja-rank fusionado en los pesos.
+
+        Efecto: y = x @ (W + scaling * (A @ B))^T + b
+        """
+        # ΔW con forma (out, in). Para F.linear necesitamos (in, out) -> transponemos.
+        delta_w_t = (self.A @ self.B).t()  # (in, out)
+
+        # Pesos efectivos: W_eff^T = W^T + scaling * ΔW^T
+        weight_eff = self.original_layer.weight + self.scaling * delta_w_t
+
+        return F.linear(x, weight_eff, self.original_layer.bias)
+
+
+def inject_lora_into_model(model, r: int = 4, alpha: int = 32, device: str = "cpu"):
     """
-    Inject LoRA layers into the linear layers of the attention modules of the model.
-    
+    Sustituye las proyecciones q,k,v,o de los bloques T5Attention por LoRA(nn.Linear).
+
     Args:
-        model (PreTrainedModel): The pre-trained model.
-        r (int): Rank of the low-rank approximation.
-        alpha (int): Scaling factor for LoRA.
-        device (torch.device): The device to run the model on ('cuda' or 'cpu').
-    
+        model (PreTrainedModel): Modelo preentrenado.
+        r (int): Rango LoRA.
+        alpha (int): Escalado LoRA.
+        device (str): 'cuda' o 'cpu'.
+
     Returns:
-        model (PreTrainedModel): The model with LoRA injected into attention layers.
+        model con LoRA inyectado en las capas de atención.
     """
-    # TODO: Iterate through all child modules of the model
-    for child_name, child_module in None:
-        # TODO: Check if the child module is a linear layer of the attention module
-        if child_name.lower() in None:
-            # TODO: Create LoRA layer for linear module
-            lora_layer = None
-            setattr(model, child_name, lora_layer)
-        else:
-            # TODO: Recursively inject LoRA into child module
-            pass
+    # Recorremos módulos y reemplazamos las lineales q,k,v,o dentro de T5Attention
+    for _, module in model.named_modules():
+        if module.__class__.__name__ == "T5Attention":
+            for attr in ["q", "k", "v", "o"]:
+                linear = getattr(module, attr, None)
+                if isinstance(linear, nn.Linear):
+                    setattr(module, attr, LoRA(linear, r=r, alpha=alpha))
     return model.to(device)
 
 
 class SoftPromptEmbedding(nn.Module):
-    def __init__(self, prompt_length, model_hidden_size):
+    def __init__(self, prompt_length: int, model_hidden_size: int):
         """
-        Creates trainable soft prompts to prepend to input embeddings.
+        Soft prompts entrenables para anteponer a embeddings de entrada.
 
         Args:
-            prompt_length (int): Number of virtual tokens in the soft prompt.
-            model_hidden_size (int): The hidden size of the pre-trained model.
+            prompt_length (int): Nº de tokens virtuales del soft prompt.
+            model_hidden_size (int): Dimensión oculta del modelo (p.ej., 512 en T5-small).
         """
         super().__init__()
-        # TODO: Initialize soft prompt embeddings
-        self.soft_prompt = None
+        self.soft_prompt = nn.Parameter(torch.randn(prompt_length, model_hidden_size))
 
-    def forward(self, input_embeddings):
+    def forward(self, input_embeddings: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass to prepend soft prompts to input embeddings.
+        Prepend de los soft prompts a los embeddings de entrada.
 
         Args:
-            input_embeddings (torch.Tensor): The original input embeddings from the tokenizer.
+            input_embeddings (Tensor): (batch, seq_len, hidden)
 
         Returns:
-            torch.Tensor: The concatenated soft prompts and original embeddings.
+            Tensor: (batch, prompt_length + seq_len, hidden)
         """
-        # TODO: Expand soft prompt to match batch size
-        batch_size = None
-        soft_prompt_expanded = None
-
-        # TODO: Concatenate soft prompt and input embeddings
-        return None
+        batch_size = input_embeddings.size(0)
+        soft_prompt_expanded = self.soft_prompt.unsqueeze(0).expand(batch_size, -1, -1)
+        return torch.cat([soft_prompt_expanded, input_embeddings], dim=1)
